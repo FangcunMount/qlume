@@ -85,6 +85,7 @@ npm run preview
 - workflow 参考 `qs-operating-system` 的约定，统一使用 `SVRB_*` secrets 发布到 `serverB`
 - `push` 到 `main/master/develop` 会执行构建校验
 - 只有 `main/master` 的 `push` 或手动触发且勾选 `deploy` 时，才会发布到 ServerB
+- 生产发布不会直接从 runner 写 `/data/www/...`，而是先上传站点包到 `ServerB:/tmp`，再在远端用 `sudo` 同步到正式目录
 
 ### Required GitHub Secrets
 
@@ -95,10 +96,13 @@ npm run preview
 ### Optional GitHub Secrets
 
 - `SVRB_SSH_PORT`: SSH 端口，可选，默认 `22`
+- `SVRB_SUDO_PASSWORD`: 如果 ServerB 上 `sudo` 需要密码，则必须配置
 - `DEPLOY_PATH_SERVERB`: 发布目录，默认 `/data/www/www.fangcunmount.cn`
-- `SVRB_POST_DEPLOY_COMMAND`: 可选，发布后执行的命令，例如 `sudo systemctl reload nginx`
+- `SVRB_POST_DEPLOY_COMMAND`: 可选，发布后执行的命令，例如 `systemctl reload nginx`
 
 ### Manual Deploy
+
+`GitHub Actions` 的生产发布会在远端通过 `sudo` 落盘。下面这个 helper 仅适用于你对目标目录本身有直接写权限的场景，不等价于线上发布流程。
 
 如果本地需要复用同一套 ServerB 发布逻辑：
 

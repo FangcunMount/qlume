@@ -33,6 +33,7 @@ jobs:
           SVRB_USERNAME: ${{ secrets.SVRB_USERNAME }}
           SVRB_SSH_KEY: ${{ secrets.SVRB_SSH_KEY }}
           SVRB_SSH_PORT: ${{ secrets.SVRB_SSH_PORT }}
+          SVRB_SUDO_PASSWORD: ${{ secrets.SVRB_SUDO_PASSWORD }}
           DEPLOY_PATH_SERVERB: ${{ secrets.DEPLOY_PATH_SERVERB }}
           SVRB_POST_DEPLOY_COMMAND: ${{ secrets.SVRB_POST_DEPLOY_COMMAND }}
         run: |
@@ -49,7 +50,7 @@ jobs:
           fi
 
           REQUIRED_SECRETS=(SVRB_HOST SVRB_USERNAME SVRB_SSH_KEY)
-          OPTIONAL_SECRETS=(SVRB_SSH_PORT DEPLOY_PATH_SERVERB SVRB_POST_DEPLOY_COMMAND)
+          OPTIONAL_SECRETS=(SVRB_SSH_PORT SVRB_SUDO_PASSWORD DEPLOY_PATH_SERVERB SVRB_POST_DEPLOY_COMMAND)
 
           for SECRET_NAME in "${REQUIRED_SECRETS[@]}"; do
             VALUE="${!SECRET_NAME:-}"
@@ -134,9 +135,6 @@ jobs:
       ((github.event_name == 'workflow_dispatch' && github.event.inputs.deploy == true) &&
        (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'))
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
       - name: Download dist artifact
         uses: actions/download-artifact@v4
         with:
@@ -147,7 +145,7 @@ jobs:
         run: |
           set -Eeuo pipefail
           sudo apt-get update
-          sudo apt-get install -y rsync openssh-client
+          sudo apt-get install -y openssh-client
 
       - name: Prepare SSH key
         shell: bash
@@ -155,25 +153,90 @@ jobs:
           SSH_KEY: ${{ secrets.SVRB_SSH_KEY }}
         run: |
           set -Eeuo pipefail
-          SSH_KEY_PATH="${RUNNER_TEMP}/svrb_id_ed25519"
-          printf '%s\n' "$SSH_KEY" | tr -d '\r' > "${SSH_KEY_PATH}"
-          chmod 600 "${SSH_KEY_PATH}"
-          ssh-keygen -lf "${SSH_KEY_PATH}"
-          echo "SVRB_SSH_KEY_FILE=${SSH_KEY_PATH}" >> "${GITHUB_ENV}"
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "$SSH_KEY" | tr -d '\r' > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keygen -lf ~/.ssh/id_ed25519
 
-      - name: Inspect downloaded artifact
+      - name: Create site bundle
         shell: bash
         run: |
           set -Eeuo pipefail
           find .artifacts/qlume-dist -maxdepth 2 -type f | sort
+          tar -C .artifacts/qlume-dist -czf /tmp/qlume-site.tar.gz .
+          ls -lh /tmp/qlume-site.tar.gz
 
-      - name: Publish dist to ServerB
+      - name: Upload site bundle to ServerB
         shell: bash
         env:
-          SVRB_HOST: ${{ secrets.SVRB_HOST }}
-          SVRB_USERNAME: ${{ secrets.SVRB_USERNAME }}
-          SVRB_SSH_PORT: ${{ secrets.SVRB_SSH_PORT }}
+          HOST: ${{ secrets.SVRB_HOST }}
+          USER: ${{ secrets.SVRB_USERNAME }}
+          PORT: ${{ secrets.SVRB_SSH_PORT || 22 }}
+        run: |
+          set -Eeuo pipefail
+          scp -i ~/.ssh/id_ed25519 -P "${PORT}" -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            /tmp/qlume-site.tar.gz "${USER}@${HOST}:/tmp/qlume-site.tar.gz"
+
+      - name: Deploy to ServerB
+        shell: bash
+        env:
+          HOST: ${{ secrets.SVRB_HOST }}
+          USER: ${{ secrets.SVRB_USERNAME }}
+          PORT: ${{ secrets.SVRB_SSH_PORT || 22 }}
+          SUDO_PASSWORD: ${{ secrets.SVRB_SUDO_PASSWORD }}
           DEPLOY_PATH_SERVERB: ${{ secrets.DEPLOY_PATH_SERVERB }}
-          DEPLOY_SOURCE_DIR: .artifacts/qlume-dist
           SVRB_POST_DEPLOY_COMMAND: ${{ secrets.SVRB_POST_DEPLOY_COMMAND }}
-        run: ./scripts/deploy_via_ssh.sh
+        run: |
+          set -Eeuo pipefail
+
+          TARGET_PATH="${DEPLOY_PATH_SERVERB:-/data/www/www.fangcunmount.cn}"
+          SSH_OPTS="-i ~/.ssh/id_ed25519 -p ${PORT} -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+          echo "Connecting to ${USER}@${HOST}:${PORT}"
+
+          cat <<'REMOTE_SCRIPT' | ssh ${SSH_OPTS} "${USER}@${HOST}" "TARGET_PATH='${TARGET_PATH}' SUDO_PASSWORD='${SUDO_PASSWORD}' POST_DEPLOY_COMMAND='${SVRB_POST_DEPLOY_COMMAND}' bash -s"
+          set -Eeuo pipefail
+
+          BUNDLE="/tmp/qlume-site.tar.gz"
+          RELEASE_DIR="$(mktemp -d)"
+          trap 'rm -rf "${RELEASE_DIR}" "${BUNDLE}"' EXIT
+
+          if sudo -n true 2>/dev/null; then
+            SUDO="sudo"
+          else
+            if [ -z "${SUDO_PASSWORD:-}" ]; then
+              echo "sudo 需要密码，但没有配置 SVRB_SUDO_PASSWORD" >&2
+              exit 1
+            fi
+            sudo_pw() { sudo -S "$@" <<<"$SUDO_PASSWORD"; }
+            export -f sudo_pw
+            SUDO="sudo_pw"
+            $SUDO -v || true
+          fi
+
+          if [ ! -f "${BUNDLE}" ]; then
+            echo "未找到站点包 ${BUNDLE}" >&2
+            exit 1
+          fi
+
+          if ! gzip -t "${BUNDLE}" 2>/dev/null; then
+            echo "站点包损坏或未传完整（gzip 校验失败）" >&2
+            exit 1
+          fi
+
+          if ! command -v rsync >/dev/null 2>&1; then
+            echo "ServerB 缺少 rsync，无法发布静态文件" >&2
+            exit 1
+          fi
+
+          tar -xzf "${BUNDLE}" -C "${RELEASE_DIR}"
+
+          $SUDO mkdir -p "${TARGET_PATH}"
+          $SUDO rsync -a --delete --chmod=D755,F644 "${RELEASE_DIR}/" "${TARGET_PATH}/"
+
+          if [ -n "${POST_DEPLOY_COMMAND:-}" ]; then
+            $SUDO bash -lc "${POST_DEPLOY_COMMAND}"
+          fi
+
+          echo "Site deployed to ${TARGET_PATH}"
+          REMOTE_SCRIPT
