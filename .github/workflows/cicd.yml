@@ -1,18 +1,98 @@
-name: CI/CD
+name: CI/CD Pipeline
 
 on:
-  pull_request:
   push:
-    branches:
-      - main
+    branches: [main, master, develop]
+  pull_request:
+    branches: [main, master, develop]
   workflow_dispatch:
+    inputs:
+      deploy:
+        description: "是否部署到 ServerB（只允许 main/master 分支）"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
 
 concurrency:
   group: qlume-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
+  validate-secrets:
+    name: Validate Secrets
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    steps:
+      - name: Check required secrets
+        shell: bash
+        env:
+          SVRB_HOST: ${{ secrets.SVRB_HOST }}
+          SVRB_USERNAME: ${{ secrets.SVRB_USERNAME }}
+          SVRB_SSH_KEY: ${{ secrets.SVRB_SSH_KEY }}
+          SVRB_SSH_PORT: ${{ secrets.SVRB_SSH_PORT }}
+          DEPLOY_PATH_SERVERB: ${{ secrets.DEPLOY_PATH_SERVERB }}
+          SVRB_POST_DEPLOY_COMMAND: ${{ secrets.SVRB_POST_DEPLOY_COMMAND }}
+        run: |
+          set -Eeuo pipefail
+
+          ENFORCE_REQUIRED=0
+          VALIDATION_FAILED=0
+
+          if [ "${GITHUB_REF}" = "refs/heads/main" ] || [ "${GITHUB_REF}" = "refs/heads/master" ]; then
+            ENFORCE_REQUIRED=1
+            echo "main/master 分支：严格校验 ServerB 部署 secrets"
+          else
+            echo "非 main/master 分支：仅提示缺失，不阻断流程"
+          fi
+
+          REQUIRED_SECRETS=(SVRB_HOST SVRB_USERNAME SVRB_SSH_KEY)
+          OPTIONAL_SECRETS=(SVRB_SSH_PORT DEPLOY_PATH_SERVERB SVRB_POST_DEPLOY_COMMAND)
+
+          for SECRET_NAME in "${REQUIRED_SECRETS[@]}"; do
+            VALUE="${!SECRET_NAME:-}"
+            if [ -n "$VALUE" ]; then
+              echo "OK: ${SECRET_NAME} is set"
+            else
+              if [ "$ENFORCE_REQUIRED" -eq 1 ]; then
+                echo "ERROR: ${SECRET_NAME} is not set"
+                VALIDATION_FAILED=1
+              else
+                echo "WARN: ${SECRET_NAME} is not set (required on main/master deploy)"
+              fi
+            fi
+          done
+
+          for SECRET_NAME in "${OPTIONAL_SECRETS[@]}"; do
+            VALUE="${!SECRET_NAME:-}"
+            if [ -n "$VALUE" ]; then
+              echo "OK: ${SECRET_NAME} is set"
+            else
+              case "$SECRET_NAME" in
+                DEPLOY_PATH_SERVERB)
+                  echo "WARN: ${SECRET_NAME} is not set, fallback to /data/www/www.fangcunmount.cn"
+                  ;;
+                SVRB_SSH_PORT)
+                  echo "WARN: ${SECRET_NAME} is not set, fallback to 22"
+                  ;;
+                *)
+                  echo "WARN: ${SECRET_NAME} is not set (optional)"
+                  ;;
+              esac
+            fi
+          done
+
+          if [ "$ENFORCE_REQUIRED" -eq 1 ] && [ "$VALIDATION_FAILED" -eq 1 ]; then
+            echo "Secrets validation failed."
+            exit 1
+          fi
+
+          echo "Secrets validation passed."
+
   build:
+    name: Build
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -40,11 +120,19 @@ jobs:
           path: dist
           if-no-files-found: error
 
-  deploy:
-    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
-    needs: build
+  deploy_serverb:
+    name: Deploy to ServerB
+    needs: [validate-secrets, build]
     runs-on: ubuntu-latest
     environment: production
+    concurrency:
+      group: qlume-production
+      cancel-in-progress: true
+    if: |
+      ((github.event_name == 'push') &&
+       (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')) ||
+      ((github.event_name == 'workflow_dispatch' && github.event.inputs.deploy == true) &&
+       (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'))
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -53,43 +141,33 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: qlume-dist
-          path: dist
+          path: .
 
       - name: Install deployment dependencies
-        run: sudo apt-get update && sudo apt-get install -y rsync openssh-client
-
-      - name: Validate deployment settings
-        env:
-          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
-          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
-          DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
-          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
         run: |
-          set -euo pipefail
-          test -n "$DEPLOY_HOST"
-          test -n "$DEPLOY_USER"
-          test -n "$DEPLOY_PATH"
-          test -n "$DEPLOY_SSH_KEY"
+          set -Eeuo pipefail
+          sudo apt-get update
+          sudo apt-get install -y rsync openssh-client
 
-      - name: Prepare SSH
+      - name: Prepare SSH key
+        shell: bash
         env:
-          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
-          DEPLOY_PORT: ${{ secrets.DEPLOY_PORT }}
-          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          SSH_KEY: ${{ secrets.SVRB_SSH_KEY }}
         run: |
-          set -euo pipefail
-          DEPLOY_PORT="${DEPLOY_PORT:-22}"
-          install -m 700 -d ~/.ssh
-          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/id_ed25519
+          set -Eeuo pipefail
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "$SSH_KEY" | tr -d '\r' > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
-          ssh-keyscan -p "$DEPLOY_PORT" "$DEPLOY_HOST" >> ~/.ssh/known_hosts
+          ssh-keygen -lf ~/.ssh/id_ed25519
 
-      - name: Publish dist to server
+      - name: Publish dist to ServerB
+        shell: bash
         env:
-          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
-          DEPLOY_PORT: ${{ secrets.DEPLOY_PORT }}
-          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
-          DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
-          DEPLOY_POST_COMMAND: ${{ secrets.DEPLOY_POST_COMMAND }}
-          DEPLOY_SSH_KEY_FILE: ~/.ssh/id_ed25519
+          SVRB_HOST: ${{ secrets.SVRB_HOST }}
+          SVRB_USERNAME: ${{ secrets.SVRB_USERNAME }}
+          SVRB_SSH_PORT: ${{ secrets.SVRB_SSH_PORT }}
+          DEPLOY_PATH_SERVERB: ${{ secrets.DEPLOY_PATH_SERVERB }}
+          SVRB_POST_DEPLOY_COMMAND: ${{ secrets.SVRB_POST_DEPLOY_COMMAND }}
+          SVRB_SSH_KEY_FILE: ~/.ssh/id_ed25519
         run: ./scripts/deploy_via_ssh.sh
