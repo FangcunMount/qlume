@@ -102,40 +102,13 @@ a {
 }
 
 .brand-mark {
-  position: relative;
   width: 48px;
   height: 48px;
   border-radius: 16px;
-  background:
-    linear-gradient(135deg, rgba(114, 236, 198, 0.18), rgba(152, 184, 255, 0.14)),
-    var(--paper-strong);
-  border: 1px solid rgba(15, 23, 40, 0.08);
-  box-shadow: var(--shadow-md);
-  overflow: hidden;
   flex: none;
-}
-
-.brand-mark::before {
-  content: '';
-  position: absolute;
-  inset: 11px;
-  border-radius: 999px;
-  border: 3px solid rgba(15, 23, 40, 0.88);
-  box-shadow: 0 0 0 6px rgba(114, 236, 198, 0.08);
-}
-
-.brand-mark::after {
-  content: '';
-  position: absolute;
-  right: 10px;
-  bottom: 10px;
-  width: 14px;
-  height: 4px;
-  border-radius: 999px;
-  background: linear-gradient(90deg, var(--mint-deep), var(--blue));
-  box-shadow: 0 0 18px rgba(114, 236, 198, 0.28);
-  transform: rotate(42deg);
-  transform-origin: center;
+  display: block;
+  object-fit: cover;
+  box-shadow: var(--shadow-md);
 }
 
 .brand-copy {
@@ -611,7 +584,6 @@ section {
 }
 
 .section-head {
-  max-width: 560px;
   display: grid;
   gap: 12px;
   margin-bottom: 28px;

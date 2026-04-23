@@ -76,7 +76,7 @@ export default function App() {
       <header className="site-header">
         <div className="container">
           <a className="brand" href="#top" aria-label="Qlume 首页">
-            <div className="brand-mark" aria-hidden="true"></div>
+            <img className="brand-mark" src="/brand/generated/qlume-mark-dark.png" alt="" aria-hidden="true" />
             <div className="brand-copy">
               <p className="brand-title">Qlume</p>
               <p className="brand-subtitle">AI Questionnaire &amp; Assessment Platform</p>
