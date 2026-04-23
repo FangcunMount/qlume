@@ -141,7 +141,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: qlume-dist
-          path: .
+          path: .artifacts/qlume-dist
 
       - name: Install deployment dependencies
         run: |
@@ -155,11 +155,17 @@ jobs:
           SSH_KEY: ${{ secrets.SVRB_SSH_KEY }}
         run: |
           set -Eeuo pipefail
-          mkdir -p ~/.ssh
-          chmod 700 ~/.ssh
-          printf '%s\n' "$SSH_KEY" | tr -d '\r' > ~/.ssh/id_ed25519
-          chmod 600 ~/.ssh/id_ed25519
-          ssh-keygen -lf ~/.ssh/id_ed25519
+          SSH_KEY_PATH="${RUNNER_TEMP}/svrb_id_ed25519"
+          printf '%s\n' "$SSH_KEY" | tr -d '\r' > "${SSH_KEY_PATH}"
+          chmod 600 "${SSH_KEY_PATH}"
+          ssh-keygen -lf "${SSH_KEY_PATH}"
+          echo "SVRB_SSH_KEY_FILE=${SSH_KEY_PATH}" >> "${GITHUB_ENV}"
+
+      - name: Inspect downloaded artifact
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          find .artifacts/qlume-dist -maxdepth 2 -type f | sort
 
       - name: Publish dist to ServerB
         shell: bash
@@ -168,6 +174,6 @@ jobs:
           SVRB_USERNAME: ${{ secrets.SVRB_USERNAME }}
           SVRB_SSH_PORT: ${{ secrets.SVRB_SSH_PORT }}
           DEPLOY_PATH_SERVERB: ${{ secrets.DEPLOY_PATH_SERVERB }}
+          DEPLOY_SOURCE_DIR: .artifacts/qlume-dist
           SVRB_POST_DEPLOY_COMMAND: ${{ secrets.SVRB_POST_DEPLOY_COMMAND }}
-          SVRB_SSH_KEY_FILE: ~/.ssh/id_ed25519
         run: ./scripts/deploy_via_ssh.sh
