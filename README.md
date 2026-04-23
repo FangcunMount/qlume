@@ -9,6 +9,7 @@ Qlume 的品牌官网前端项目，基于 React + TypeScript + Vite。
 - React
 - TypeScript
 - Vite
+- Docker
 - GitHub Actions
 
 ## Project Structure
@@ -16,9 +17,12 @@ Qlume 的品牌官网前端项目，基于 React + TypeScript + Vite。
 ```text
 qlume/
 ├── .github/workflows/cicd.yml
+├── build/
+│   ├── docker-compose.yml
+│   ├── nginx/default.conf
+│   └── Dockerfile
 ├── deploy/nginx/www.fangcunmount.cn.conf
 ├── public/
-├── scripts/deploy_via_ssh.sh
 ├── src/
 │   ├── components/
 │   ├── App.tsx
@@ -49,6 +53,18 @@ npm run preview
 ```
 
 构建产物输出到 `dist/`。
+
+## Docker
+
+本地可以直接构建并启动容器：
+
+```bash
+docker build -f build/Dockerfile -t qlume-local .
+docker run --rm -p 3000:3000 qlume-local
+```
+
+容器内使用 `nginx` 托管构建后的静态资源，并在 `3000` 端口提供 SPA 路由回退。
+如果你想按 `qs-operating-system` 的方式接入外部 Docker 网络，也可以直接用 [build/docker-compose.yml](/Users/yangshujie/workspace/typescript/github.com/fangcun-mount/qlume/build/docker-compose.yml:1)。
 
 ## Brand Assets
 
@@ -82,10 +98,12 @@ npm run preview
 
 - Nginx 示例配置在 [deploy/nginx/www.fangcunmount.cn.conf](deploy/nginx/www.fangcunmount.cn.conf)
 - GitHub Actions 工作流在 [.github/workflows/cicd.yml](.github/workflows/cicd.yml)
-- workflow 参考 `qs-operating-system` 的约定，统一使用 `SVRB_*` secrets 发布到 `serverB`
-- `push` 到 `main/master/develop` 会执行构建校验
-- 只有 `main/master` 的 `push` 或手动触发且勾选 `deploy` 时，才会发布到 ServerB
-- 生产发布不会直接从 runner 写 `/data/www/...`，而是先上传站点包到 `ServerB:/tmp`，再在远端用 `sudo` 同步到正式目录
+- workflow 参考 `qs-operating-system` 的约定，统一使用 `SVRB_*` secrets 构建镜像并发布到 `serverB`
+- `push` 到 `main/master/develop` 会执行 lint 和前端构建校验
+- `push` 到 `main/master`，或手动触发并勾选 `deploy` 时，会执行镜像构建、推送到 GHCR，并在 ServerB 上更新容器
+- 容器会加入外部 Docker 网络 `infra-network`
+- 同网络内的上游容器可以直接通过 `http://qlume:3000` 访问它
+- 如果上游不是容器，而是宿主机上的 Nginx，则仍可通过宿主机端口访问，默认是 `3001`
 
 ### Required GitHub Secrets
 
@@ -97,23 +115,19 @@ npm run preview
 
 - `SVRB_SSH_PORT`: SSH 端口，可选，默认 `22`
 - `SVRB_SUDO_PASSWORD`: 如果 ServerB 上 `sudo` 需要密码，则必须配置
-- `DEPLOY_PATH_SERVERB`: 发布目录，默认 `/data/www/www.fangcunmount.cn`
-- `SVRB_POST_DEPLOY_COMMAND`: 可选，发布后执行的命令，例如 `systemctl reload nginx`
+- `APP_PORT_SERVERB`: 宿主机暴露给 Nginx 反向代理的本地端口，默认 `3001`
+- `DOCKERHUB_USERNAME`: 可选，配置后会额外镜像同步到 Docker Hub
+- `DOCKERHUB_TOKEN`: 可选，Docker Hub access token
 
-### Manual Deploy
+### ServerB Runtime
 
-`GitHub Actions` 的生产发布会在远端通过 `sudo` 落盘。下面这个 helper 仅适用于你对目标目录本身有直接写权限的场景，不等价于线上发布流程。
-
-如果本地需要复用同一套 ServerB 发布逻辑：
-
-```bash
-npm run build
-SVRB_HOST=example.com \
-SVRB_USERNAME=deploy \
-DEPLOY_PATH_SERVERB=/data/www/www.fangcunmount.cn \
-SVRB_SSH_KEY_FILE=$HOME/.ssh/id_ed25519 \
-./scripts/deploy_via_ssh.sh
-```
+- 容器名：`qlume`
+- Docker network：`infra-network`
+- Docker network alias：`qlume`
+- 容器内监听端口：`3000`
+- 同网络容器访问地址：`http://qlume:3000`
+- 宿主机默认绑定端口：`3001`
+- 镜像地址：`ghcr.io/fangcunmount/qlume`
 
 ## Notes
 

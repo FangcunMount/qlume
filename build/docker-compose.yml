@@ -1,0 +1,17 @@
+version: "3.8"
+
+services:
+  qlume:
+    image: ghcr.io/fangcunmount/qlume:latest
+    container_name: qlume
+    ports:
+      - "3001:3000"
+    restart: unless-stopped
+    networks:
+      infra-network:
+        aliases:
+          - qlume
+
+networks:
+  infra-network:
+    external: true

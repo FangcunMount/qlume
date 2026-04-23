@@ -15,10 +15,17 @@ on:
 
 permissions:
   contents: read
+  packages: write
 
 concurrency:
   group: qlume-${{ github.ref }}
   cancel-in-progress: true
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE: ghcr.io/fangcunmount/qlume
+  IMAGE_DOCKERHUB: fangcunmount/qlume
+  DOCKERFILE: build/Dockerfile
 
 jobs:
   validate-secrets:
@@ -34,23 +41,23 @@ jobs:
           SVRB_SSH_KEY: ${{ secrets.SVRB_SSH_KEY }}
           SVRB_SSH_PORT: ${{ secrets.SVRB_SSH_PORT }}
           SVRB_SUDO_PASSWORD: ${{ secrets.SVRB_SUDO_PASSWORD }}
-          DEPLOY_PATH_SERVERB: ${{ secrets.DEPLOY_PATH_SERVERB }}
-          SVRB_POST_DEPLOY_COMMAND: ${{ secrets.SVRB_POST_DEPLOY_COMMAND }}
+          APP_PORT_SERVERB: ${{ secrets.APP_PORT_SERVERB }}
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
         run: |
           set -Eeuo pipefail
-
           ENFORCE_REQUIRED=0
           VALIDATION_FAILED=0
 
           if [ "${GITHUB_REF}" = "refs/heads/main" ] || [ "${GITHUB_REF}" = "refs/heads/master" ]; then
             ENFORCE_REQUIRED=1
-            echo "main/master 分支：严格校验 ServerB 部署 secrets"
+            echo "main/master 分支：严格校验部署必需 secrets"
           else
-            echo "非 main/master 分支：仅提示缺失，不阻断流程"
+            echo "非 main/master 分支：仅提示缺失，不阻断"
           fi
 
           REQUIRED_SECRETS=(SVRB_HOST SVRB_USERNAME SVRB_SSH_KEY)
-          OPTIONAL_SECRETS=(SVRB_SSH_PORT SVRB_SUDO_PASSWORD DEPLOY_PATH_SERVERB SVRB_POST_DEPLOY_COMMAND)
+          OPTIONAL_SECRETS=(SVRB_SSH_PORT SVRB_SUDO_PASSWORD APP_PORT_SERVERB DOCKERHUB_USERNAME DOCKERHUB_TOKEN)
 
           for SECRET_NAME in "${REQUIRED_SECRETS[@]}"; do
             VALUE="${!SECRET_NAME:-}"
@@ -72,11 +79,14 @@ jobs:
               echo "OK: ${SECRET_NAME} is set"
             else
               case "$SECRET_NAME" in
-                DEPLOY_PATH_SERVERB)
-                  echo "WARN: ${SECRET_NAME} is not set, fallback to /data/www/www.fangcunmount.cn"
-                  ;;
                 SVRB_SSH_PORT)
                   echo "WARN: ${SECRET_NAME} is not set, fallback to 22"
+                  ;;
+                APP_PORT_SERVERB)
+                  echo "WARN: ${SECRET_NAME} is not set, fallback to 3001"
+                  ;;
+                DOCKERHUB_TOKEN|DOCKERHUB_USERNAME)
+                  echo "WARN: ${SECRET_NAME} is not set — GHCR 失败时无法回退 Docker Hub"
                   ;;
                 *)
                   echo "WARN: ${SECRET_NAME} is not set (optional)"
@@ -89,24 +99,20 @@ jobs:
             echo "Secrets validation failed."
             exit 1
           fi
-
           echo "Secrets validation passed."
 
-  build:
-    name: Build
+  test_lint:
+    name: Test And Lint
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
+      - uses: actions/setup-node@v4
         with:
           node-version: 22
           cache: npm
 
-      - name: Install dependencies
-        run: npm ci
+      - run: npm ci
 
       - name: Lint
         run: npm run lint
@@ -114,17 +120,87 @@ jobs:
       - name: Build
         run: npm run build
 
-      - name: Upload dist artifact
-        uses: actions/upload-artifact@v4
+  docker_build_push:
+    name: Build And Push Image
+    needs: [validate-secrets, test_lint]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Login GHCR
+        uses: docker/login-action@v3
         with:
-          name: qlume-dist
-          path: dist
-          if-no-files-found: error
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute image tags
+        id: image_meta
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          TAGS="${IMAGE}:sha-${GITHUB_SHA}"
+          if [ "${GITHUB_REF}" = "refs/heads/main" ] || [ "${GITHUB_REF}" = "refs/heads/master" ]; then
+            TAGS="${TAGS}"$'\n'"${IMAGE}:latest"
+          fi
+          {
+            echo "tags<<EOF"
+            echo "${TAGS}"
+            echo "EOF"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Build And Push GHCR
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ env.DOCKERFILE }}
+          push: true
+          tags: ${{ steps.image_meta.outputs.tags }}
+          build-args: |
+            BUILD_SHA=${{ github.sha }}
+            BUILD_REF=${{ github.ref_name }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Mirror image to Docker Hub (optional)
+        shell: bash
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          set -Eeuo pipefail
+          if [ -z "${DOCKERHUB_USERNAME:-}" ] || [ -z "${DOCKERHUB_TOKEN:-}" ]; then
+            echo "Docker Hub credentials missing, skip mirror."
+            exit 0
+          fi
+          if ! echo "${DOCKERHUB_TOKEN}" | docker login -u "${DOCKERHUB_USERNAME}" --password-stdin; then
+            echo "Docker Hub login failed, skip mirror."
+            exit 0
+          fi
+          if ! docker buildx imagetools create -t "${IMAGE_DOCKERHUB}:sha-${GITHUB_SHA}" "${IMAGE}:sha-${GITHUB_SHA}"; then
+            echo "Mirror sha tag failed, keep GHCR as source of truth."
+            exit 0
+          fi
+          if [ "${GITHUB_REF}" = "refs/heads/main" ] || [ "${GITHUB_REF}" = "refs/heads/master" ]; then
+            if ! docker buildx imagetools create -t "${IMAGE_DOCKERHUB}:latest" "${IMAGE}:latest"; then
+              echo "Mirror latest tag failed, keep GHCR as source of truth."
+              exit 0
+            fi
+          fi
 
   deploy_serverb:
-    name: Deploy to ServerB
-    needs: [validate-secrets, build]
+    name: Deploy To ServerB
+    needs: [docker_build_push]
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
     environment: production
     concurrency:
       group: qlume-production
@@ -135,18 +211,6 @@ jobs:
       ((github.event_name == 'workflow_dispatch' && github.event.inputs.deploy == true) &&
        (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'))
     steps:
-      - name: Download dist artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: qlume-dist
-          path: .artifacts/qlume-dist
-
-      - name: Install deployment dependencies
-        run: |
-          set -Eeuo pipefail
-          sudo apt-get update
-          sudo apt-get install -y openssh-client
-
       - name: Prepare SSH key
         shell: bash
         env:
@@ -159,15 +223,23 @@ jobs:
           chmod 600 ~/.ssh/id_ed25519
           ssh-keygen -lf ~/.ssh/id_ed25519
 
-      - name: Create site bundle
-        shell: bash
+      - name: Login GHCR (runner, for image pull)
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pull image on runner and export bundle
+        env:
+          IMAGE_REF: ${{ env.IMAGE }}:sha-${{ github.sha }}
         run: |
           set -Eeuo pipefail
-          find .artifacts/qlume-dist -maxdepth 2 -type f | sort
-          tar -C .artifacts/qlume-dist -czf /tmp/qlume-site.tar.gz .
-          ls -lh /tmp/qlume-site.tar.gz
+          docker pull "${IMAGE_REF}"
+          docker save "${IMAGE_REF}" | gzip -1 > /tmp/qlume-image.tar.gz
+          ls -lh /tmp/qlume-image.tar.gz
 
-      - name: Upload site bundle to ServerB
+      - name: Upload image bundle to ServerB
         shell: bash
         env:
           HOST: ${{ secrets.SVRB_HOST }}
@@ -176,7 +248,7 @@ jobs:
         run: |
           set -Eeuo pipefail
           scp -i ~/.ssh/id_ed25519 -P "${PORT}" -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-            /tmp/qlume-site.tar.gz "${USER}@${HOST}:/tmp/qlume-site.tar.gz"
+            /tmp/qlume-image.tar.gz "${USER}@${HOST}:/tmp/qlume-image.tar.gz"
 
       - name: Deploy to ServerB
         shell: bash
@@ -185,21 +257,26 @@ jobs:
           USER: ${{ secrets.SVRB_USERNAME }}
           PORT: ${{ secrets.SVRB_SSH_PORT || 22 }}
           SUDO_PASSWORD: ${{ secrets.SVRB_SUDO_PASSWORD }}
-          DEPLOY_PATH_SERVERB: ${{ secrets.DEPLOY_PATH_SERVERB }}
-          SVRB_POST_DEPLOY_COMMAND: ${{ secrets.SVRB_POST_DEPLOY_COMMAND }}
+          IMAGE: ${{ env.IMAGE }}
+          IMAGE_SHA: ${{ github.sha }}
+          APP_PORT_SERVERB: ${{ secrets.APP_PORT_SERVERB }}
         run: |
           set -Eeuo pipefail
 
-          TARGET_PATH="${DEPLOY_PATH_SERVERB:-/data/www/www.fangcunmount.cn}"
           SSH_OPTS="-i ~/.ssh/id_ed25519 -p ${PORT} -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
           echo "Connecting to ${USER}@${HOST}:${PORT}"
 
-          cat <<'REMOTE_SCRIPT' | ssh ${SSH_OPTS} "${USER}@${HOST}" "TARGET_PATH='${TARGET_PATH}' SUDO_PASSWORD='${SUDO_PASSWORD}' POST_DEPLOY_COMMAND='${SVRB_POST_DEPLOY_COMMAND}' bash -s"
+          cat <<'REMOTE_SCRIPT' | ssh ${SSH_OPTS} "${USER}@${HOST}" "IMAGE=${IMAGE} IMAGE_SHA=${IMAGE_SHA} APP_PORT_SERVERB='${APP_PORT_SERVERB}' SUDO_PASSWORD='${SUDO_PASSWORD}' bash -s"
           set -Eeuo pipefail
 
-          BUNDLE="/tmp/qlume-site.tar.gz"
-          RELEASE_DIR="$(mktemp -d)"
-          trap 'rm -rf "${RELEASE_DIR}" "${BUNDLE}"' EXIT
+          CONTAINER_NAME="qlume"
+          NETWORK_NAME="infra-network"
+          IMAGE_NAME="${IMAGE}:sha-${IMAGE_SHA}"
+          BUNDLE="/tmp/qlume-image.tar.gz"
+          APP_PORT="3000"
+          HOST_PORT="${APP_PORT_SERVERB:-3001}"
+          PREV_IMAGE=""
+          USE_IMAGE="${IMAGE_NAME}"
 
           if sudo -n true 2>/dev/null; then
             SUDO="sudo"
@@ -214,29 +291,82 @@ jobs:
             $SUDO -v || true
           fi
 
+          if ! command -v docker >/dev/null 2>&1; then
+            echo "ServerB 缺少 docker，无法部署容器" >&2
+            exit 1
+          fi
+
           if [ ! -f "${BUNDLE}" ]; then
-            echo "未找到站点包 ${BUNDLE}" >&2
+            echo "未找到镜像包 ${BUNDLE}" >&2
             exit 1
           fi
-
           if ! gzip -t "${BUNDLE}" 2>/dev/null; then
-            echo "站点包损坏或未传完整（gzip 校验失败）" >&2
+            echo "镜像包损坏或未传完整（gzip 校验失败）" >&2
             exit 1
           fi
 
-          if ! command -v rsync >/dev/null 2>&1; then
-            echo "ServerB 缺少 rsync，无法发布静态文件" >&2
+          TEMP_TAR="$(mktemp)"
+          gunzip -c "${BUNDLE}" > "${TEMP_TAR}"
+          $SUDO docker load -i "${TEMP_TAR}"
+          rm -f "${TEMP_TAR}" "${BUNDLE}"
+
+          if ! $SUDO docker network ls --format '{{.Name}}' | grep -q "^${NETWORK_NAME}$"; then
+            echo "Network ${NETWORK_NAME} not found, creating..."
+            $SUDO docker network create "${NETWORK_NAME}"
+          fi
+
+          if $SUDO docker ps -a --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
+            PREV_IMAGE="$($SUDO docker inspect --format '{{.Config.Image}}' "${CONTAINER_NAME}" 2>/dev/null || true)"
+            if [ -n "${PREV_IMAGE}" ]; then
+              echo "Previous image detected: ${PREV_IMAGE}"
+            fi
+            $SUDO docker stop "${CONTAINER_NAME}" || true
+            $SUDO docker rm "${CONTAINER_NAME}" || true
+          fi
+
+          echo "Run container: ${CONTAINER_NAME}"
+          $SUDO docker run -d \
+            --name "${CONTAINER_NAME}" \
+            --network "${NETWORK_NAME}" \
+            --network-alias "qlume" \
+            --restart unless-stopped \
+            -p ${HOST_PORT}:${APP_PORT} \
+            "${USE_IMAGE}"
+
+          echo "Health check (docker exec -> http://127.0.0.1:${APP_PORT}/)..."
+          HEALTH_OK=0
+          sleep 5
+          for i in $(seq 1 45); do
+            if $SUDO docker exec "${CONTAINER_NAME}" wget -qO- -T 3 "http://127.0.0.1:${APP_PORT}/" >/dev/null 2>&1; then
+              HEALTH_OK=1
+              break
+            fi
+            sleep 2
+          done
+
+          if [ "${HEALTH_OK}" -ne 1 ]; then
+            echo "Health check failed, start rollback..."
+            $SUDO docker logs --tail 100 "${CONTAINER_NAME}" || true
+            $SUDO docker stop "${CONTAINER_NAME}" || true
+            $SUDO docker rm "${CONTAINER_NAME}" || true
+
+            if [ -n "${PREV_IMAGE}" ]; then
+              echo "Rollback to previous image: ${PREV_IMAGE}"
+              $SUDO docker run -d \
+                --name "${CONTAINER_NAME}" \
+                --network "${NETWORK_NAME}" \
+                --network-alias "qlume" \
+                --restart unless-stopped \
+                -p ${HOST_PORT}:${APP_PORT} \
+                "${PREV_IMAGE}"
+              echo "Deployment rolled back."
+              $SUDO docker ps --filter "name=${CONTAINER_NAME}" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}\t{{.Image}}"
+            else
+              echo "No previous image available, rollback skipped." >&2
+            fi
             exit 1
           fi
 
-          tar -xzf "${BUNDLE}" -C "${RELEASE_DIR}"
-
-          $SUDO mkdir -p "${TARGET_PATH}"
-          $SUDO rsync -a --delete --chmod=D755,F644 "${RELEASE_DIR}/" "${TARGET_PATH}/"
-
-          if [ -n "${POST_DEPLOY_COMMAND:-}" ]; then
-            $SUDO bash -lc "${POST_DEPLOY_COMMAND}"
-          fi
-
-          echo "Site deployed to ${TARGET_PATH}"
+          echo "Done. Current status:"
+          $SUDO docker ps --filter "name=${CONTAINER_NAME}" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}\t{{.Image}}"
           REMOTE_SCRIPT
