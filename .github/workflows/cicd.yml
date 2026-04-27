@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
     inputs:
       deploy:
-        description: "是否部署到 ServerB（只允许 main/master 分支）"
+        description: "是否部署到 ServerD（只允许 main/master 分支）"
         required: false
         type: boolean
         default: false
@@ -36,12 +36,12 @@ jobs:
       - name: Check required secrets
         shell: bash
         env:
-          SVRB_HOST: ${{ secrets.SVRB_HOST }}
-          SVRB_USERNAME: ${{ secrets.SVRB_USERNAME }}
-          SVRB_SSH_KEY: ${{ secrets.SVRB_SSH_KEY }}
-          SVRB_SSH_PORT: ${{ secrets.SVRB_SSH_PORT }}
-          SVRB_SUDO_PASSWORD: ${{ secrets.SVRB_SUDO_PASSWORD }}
-          APP_PORT_SERVERB: ${{ secrets.APP_PORT_SERVERB }}
+          SVRD_HOST: ${{ secrets.SVRD_HOST }}
+          SVRD_USERNAME: ${{ secrets.SVRD_USERNAME }}
+          SVRD_SSH_KEY: ${{ secrets.SVRD_SSH_KEY }}
+          SVRD_SSH_PORT: ${{ secrets.SVRD_SSH_PORT }}
+          SVRD_SUDO_PASSWORD: ${{ secrets.SVRD_SUDO_PASSWORD }}
+          APP_PORT_SERVERD: ${{ secrets.APP_PORT_SERVERD }}
           DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
           DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
         run: |
@@ -56,8 +56,8 @@ jobs:
             echo "非 main/master 分支：仅提示缺失，不阻断"
           fi
 
-          REQUIRED_SECRETS=(SVRB_HOST SVRB_USERNAME SVRB_SSH_KEY)
-          OPTIONAL_SECRETS=(SVRB_SSH_PORT SVRB_SUDO_PASSWORD APP_PORT_SERVERB DOCKERHUB_USERNAME DOCKERHUB_TOKEN)
+          REQUIRED_SECRETS=(SVRD_HOST SVRD_USERNAME SVRD_SSH_KEY)
+          OPTIONAL_SECRETS=(SVRD_SSH_PORT SVRD_SUDO_PASSWORD APP_PORT_SERVERD DOCKERHUB_USERNAME DOCKERHUB_TOKEN)
 
           for SECRET_NAME in "${REQUIRED_SECRETS[@]}"; do
             VALUE="${!SECRET_NAME:-}"
@@ -79,10 +79,10 @@ jobs:
               echo "OK: ${SECRET_NAME} is set"
             else
               case "$SECRET_NAME" in
-                SVRB_SSH_PORT)
+                SVRD_SSH_PORT)
                   echo "WARN: ${SECRET_NAME} is not set, fallback to 22"
                   ;;
-                APP_PORT_SERVERB)
+                APP_PORT_SERVERD)
                   echo "WARN: ${SECRET_NAME} is not set, fallback to 3001"
                   ;;
                 DOCKERHUB_TOKEN|DOCKERHUB_USERNAME)
@@ -194,8 +194,8 @@ jobs:
             fi
           fi
 
-  deploy_serverb:
-    name: Deploy To ServerB
+  deploy_serverd:
+    name: Deploy To ServerD
     needs: [docker_build_push]
     runs-on: ubuntu-latest
     permissions:
@@ -214,7 +214,7 @@ jobs:
       - name: Prepare SSH key
         shell: bash
         env:
-          SSH_KEY: ${{ secrets.SVRB_SSH_KEY }}
+          SSH_KEY: ${{ secrets.SVRD_SSH_KEY }}
         run: |
           set -Eeuo pipefail
           mkdir -p ~/.ssh
@@ -239,34 +239,34 @@ jobs:
           docker save "${IMAGE_REF}" | gzip -1 > /tmp/qlume-image.tar.gz
           ls -lh /tmp/qlume-image.tar.gz
 
-      - name: Upload image bundle to ServerB
+      - name: Upload image bundle to ServerD
         shell: bash
         env:
-          HOST: ${{ secrets.SVRB_HOST }}
-          USER: ${{ secrets.SVRB_USERNAME }}
-          PORT: ${{ secrets.SVRB_SSH_PORT || 22 }}
+          HOST: ${{ secrets.SVRD_HOST }}
+          USER: ${{ secrets.SVRD_USERNAME }}
+          PORT: ${{ secrets.SVRD_SSH_PORT || 22 }}
         run: |
           set -Eeuo pipefail
           scp -i ~/.ssh/id_ed25519 -P "${PORT}" -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
             /tmp/qlume-image.tar.gz "${USER}@${HOST}:/tmp/qlume-image.tar.gz"
 
-      - name: Deploy to ServerB
+      - name: Deploy to ServerD
         shell: bash
         env:
-          HOST: ${{ secrets.SVRB_HOST }}
-          USER: ${{ secrets.SVRB_USERNAME }}
-          PORT: ${{ secrets.SVRB_SSH_PORT || 22 }}
-          SUDO_PASSWORD: ${{ secrets.SVRB_SUDO_PASSWORD }}
+          HOST: ${{ secrets.SVRD_HOST }}
+          USER: ${{ secrets.SVRD_USERNAME }}
+          PORT: ${{ secrets.SVRD_SSH_PORT || 22 }}
+          SUDO_PASSWORD: ${{ secrets.SVRD_SUDO_PASSWORD }}
           IMAGE: ${{ env.IMAGE }}
           IMAGE_SHA: ${{ github.sha }}
-          APP_PORT_SERVERB: ${{ secrets.APP_PORT_SERVERB }}
+          APP_PORT_SERVERD: ${{ secrets.APP_PORT_SERVERD }}
         run: |
           set -Eeuo pipefail
 
           SSH_OPTS="-i ~/.ssh/id_ed25519 -p ${PORT} -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
           echo "Connecting to ${USER}@${HOST}:${PORT}"
 
-          cat <<'REMOTE_SCRIPT' | ssh ${SSH_OPTS} "${USER}@${HOST}" "IMAGE=${IMAGE} IMAGE_SHA=${IMAGE_SHA} APP_PORT_SERVERB='${APP_PORT_SERVERB}' SUDO_PASSWORD='${SUDO_PASSWORD}' bash -s"
+          cat <<'REMOTE_SCRIPT' | ssh ${SSH_OPTS} "${USER}@${HOST}" "IMAGE=${IMAGE} IMAGE_SHA=${IMAGE_SHA} APP_PORT_SERVERD='${APP_PORT_SERVERD}' SUDO_PASSWORD='${SUDO_PASSWORD}' bash -s"
           set -Eeuo pipefail
 
           CONTAINER_NAME="qlume"
@@ -274,7 +274,7 @@ jobs:
           IMAGE_NAME="${IMAGE}:sha-${IMAGE_SHA}"
           BUNDLE="/tmp/qlume-image.tar.gz"
           APP_PORT="3000"
-          HOST_PORT="${APP_PORT_SERVERB:-3001}"
+          HOST_PORT="${APP_PORT_SERVERD:-3001}"
           PREV_IMAGE=""
           USE_IMAGE="${IMAGE_NAME}"
 
@@ -282,7 +282,7 @@ jobs:
             SUDO="sudo"
           else
             if [ -z "${SUDO_PASSWORD:-}" ]; then
-              echo "sudo 需要密码，但没有配置 SVRB_SUDO_PASSWORD" >&2
+              echo "sudo 需要密码，但没有配置 SVRD_SUDO_PASSWORD" >&2
               exit 1
             fi
             sudo_pw() { sudo -S "$@" <<<"$SUDO_PASSWORD"; }
@@ -292,7 +292,7 @@ jobs:
           fi
 
           if ! command -v docker >/dev/null 2>&1; then
-            echo "ServerB 缺少 docker，无法部署容器" >&2
+            echo "ServerD 缺少 docker，无法部署容器" >&2
             exit 1
           fi
 
@@ -311,8 +311,8 @@ jobs:
           rm -f "${TEMP_TAR}" "${BUNDLE}"
 
           if ! $SUDO docker network ls --format '{{.Name}}' | grep -q "^${NETWORK_NAME}$"; then
-            echo "Network ${NETWORK_NAME} not found, creating..."
-            $SUDO docker network create "${NETWORK_NAME}"
+            echo "Network ${NETWORK_NAME} not found. Initialize ServerD Swarm/infra-network first." >&2
+            exit 1
           fi
 
           if $SUDO docker ps -a --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
