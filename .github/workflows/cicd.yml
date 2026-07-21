@@ -36,12 +36,13 @@ jobs:
       - name: Check required secrets
         shell: bash
         env:
-          SVRD_HOST: ${{ secrets.SVRD_HOST }}
-          SVRD_USERNAME: ${{ secrets.SVRD_USERNAME }}
+          # HOST/USERNAME/PORT 优先用 org Variables，SSH 密钥仍走 Secrets
+          SVRD_HOST: ${{ vars.SVRD_HOST || secrets.SVRD_HOST }}
+          SVRD_USERNAME: ${{ vars.SVRD_USERNAME || secrets.SVRD_USERNAME }}
           SVRD_SSH_KEY: ${{ secrets.SVRD_SSH_KEY }}
-          SVRD_SSH_PORT: ${{ secrets.SVRD_SSH_PORT }}
+          SVRD_SSH_PORT: ${{ vars.SVRD_SSH_PORT || secrets.SVRD_SSH_PORT }}
           SVRD_SUDO_PASSWORD: ${{ secrets.SVRD_SUDO_PASSWORD }}
-          APP_PORT_SERVERD: ${{ secrets.APP_PORT_SERVERD }}
+          APP_PORT_SERVERD: ${{ secrets.APP_PORT_SERVERD || vars.APP_PORT_SERVERD }}
           DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
           DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
         run: |
@@ -51,7 +52,7 @@ jobs:
 
           if [ "${GITHUB_REF}" = "refs/heads/main" ] || [ "${GITHUB_REF}" = "refs/heads/master" ]; then
             ENFORCE_REQUIRED=1
-            echo "main/master 分支：严格校验部署必需 secrets"
+            echo "main/master 分支：严格校验部署必需配置"
           else
             echo "非 main/master 分支：仅提示缺失，不阻断"
           fi
@@ -197,14 +198,16 @@ jobs:
   deploy_serverd:
     name: Deploy To ServerD
     needs: [docker_build_push]
-    runs-on: ubuntu-latest
+    runs-on:
+      group: qlume
+      labels: [self-hosted, macOS, ARM64]
     permissions:
       contents: read
       packages: read
     environment: production
     concurrency:
       group: qlume-production
-      cancel-in-progress: true
+      cancel-in-progress: false
     if: |
       ((github.event_name == 'push') &&
        (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')) ||
@@ -235,35 +238,36 @@ jobs:
           IMAGE_REF: ${{ env.IMAGE }}:sha-${{ github.sha }}
         run: |
           set -Eeuo pipefail
-          docker pull "${IMAGE_REF}"
+          # Mac Runner 为 ARM64，serverD 为 linux/amd64，必须指定平台
+          docker pull --platform linux/amd64 "${IMAGE_REF}"
           docker save "${IMAGE_REF}" | gzip -1 > /tmp/qlume-image.tar.gz
           ls -lh /tmp/qlume-image.tar.gz
 
       - name: Upload image bundle to ServerD
         shell: bash
         env:
-          HOST: ${{ secrets.SVRD_HOST }}
-          USER: ${{ secrets.SVRD_USERNAME }}
-          PORT: ${{ secrets.SVRD_SSH_PORT || 22 }}
+          HOST: ${{ vars.SVRD_HOST || secrets.SVRD_HOST }}
+          USER: ${{ vars.SVRD_USERNAME || secrets.SVRD_USERNAME }}
+          PORT: ${{ vars.SVRD_SSH_PORT || secrets.SVRD_SSH_PORT || 22 }}
         run: |
           set -Eeuo pipefail
-          scp -i ~/.ssh/id_ed25519 -P "${PORT}" -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+          scp -i ~/.ssh/id_ed25519 -P "${PORT}" -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
             /tmp/qlume-image.tar.gz "${USER}@${HOST}:/tmp/qlume-image.tar.gz"
 
       - name: Deploy to ServerD
         shell: bash
         env:
-          HOST: ${{ secrets.SVRD_HOST }}
-          USER: ${{ secrets.SVRD_USERNAME }}
-          PORT: ${{ secrets.SVRD_SSH_PORT || 22 }}
+          HOST: ${{ vars.SVRD_HOST || secrets.SVRD_HOST }}
+          USER: ${{ vars.SVRD_USERNAME || secrets.SVRD_USERNAME }}
+          PORT: ${{ vars.SVRD_SSH_PORT || secrets.SVRD_SSH_PORT || 22 }}
           SUDO_PASSWORD: ${{ secrets.SVRD_SUDO_PASSWORD }}
           IMAGE: ${{ env.IMAGE }}
           IMAGE_SHA: ${{ github.sha }}
-          APP_PORT_SERVERD: ${{ secrets.APP_PORT_SERVERD }}
+          APP_PORT_SERVERD: ${{ secrets.APP_PORT_SERVERD || vars.APP_PORT_SERVERD }}
         run: |
           set -Eeuo pipefail
 
-          SSH_OPTS="-i ~/.ssh/id_ed25519 -p ${PORT} -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+          SSH_OPTS="-i ~/.ssh/id_ed25519 -p ${PORT} -o BatchMode=yes -o StrictHostKeyChecking=accept-new"
           echo "Connecting to ${USER}@${HOST}:${PORT}"
 
           cat <<'REMOTE_SCRIPT' | ssh ${SSH_OPTS} "${USER}@${HOST}" "IMAGE=${IMAGE} IMAGE_SHA=${IMAGE_SHA} APP_PORT_SERVERD='${APP_PORT_SERVERD}' SUDO_PASSWORD='${SUDO_PASSWORD}' bash -s"
@@ -370,3 +374,10 @@ jobs:
           echo "Done. Current status:"
           $SUDO docker ps --filter "name=${CONTAINER_NAME}" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}\t{{.Image}}"
           REMOTE_SCRIPT
+
+      - name: Cleanup runner artifacts
+        if: always()
+        shell: bash
+        run: |
+          rm -f /tmp/qlume-image.tar.gz ~/.ssh/id_ed25519
+          docker image prune -f >/dev/null 2>&1 || true
