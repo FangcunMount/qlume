@@ -208,6 +208,10 @@ jobs:
     concurrency:
       group: qlume-production
       cancel-in-progress: false
+    env:
+      # 隔离 docker 配置：避免 macOS self-hosted runner 上的
+      # credsStore(desktop/osxkeychain) 触发 GUI 授权而卡住 docker login
+      DOCKER_CONFIG: ${{ runner.temp }}/docker-config-${{ github.run_id }}
     if: |
       ((github.event_name == 'push') &&
        (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')) ||
@@ -380,4 +384,5 @@ jobs:
         shell: bash
         run: |
           rm -f /tmp/qlume-image.tar.gz ~/.ssh/id_ed25519
+          rm -rf "${DOCKER_CONFIG}" 2>/dev/null || true
           docker image prune -f >/dev/null 2>&1 || true
