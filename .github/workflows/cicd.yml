@@ -259,18 +259,20 @@ jobs:
       - name: Upload image bundle to ServerD
         shell: bash
         env:
-          HOST: ${{ vars.SVRD_HOST || secrets.SVRD_HOST }}
+          # 大文件走公网：Tailscale DERP 中继太慢（~50KB/s）；打洞成功前优先公网
+          HOST: ${{ vars.SVRD_PUBLIC_HOST || secrets.SVRD_PUBLIC_HOST || vars.SVRD_HOST || secrets.SVRD_HOST }}
           USER: ${{ vars.SVRD_USERNAME || secrets.SVRD_USERNAME }}
           PORT: ${{ vars.SVRD_SSH_PORT || secrets.SVRD_SSH_PORT || 22 }}
         run: |
           set -Eeuo pipefail
+          echo "Uploading bundle to ${USER}@${HOST}:${PORT}"
           scp -i "${SSH_KEY_PATH}" -P "${PORT}" -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
             /tmp/qlume-image.tar.gz "${USER}@${HOST}:/tmp/qlume-image.tar.gz"
 
       - name: Deploy to ServerD
         shell: bash
         env:
-          HOST: ${{ vars.SVRD_HOST || secrets.SVRD_HOST }}
+          HOST: ${{ vars.SVRD_PUBLIC_HOST || secrets.SVRD_PUBLIC_HOST || vars.SVRD_HOST || secrets.SVRD_HOST }}
           USER: ${{ vars.SVRD_USERNAME || secrets.SVRD_USERNAME }}
           PORT: ${{ vars.SVRD_SSH_PORT || secrets.SVRD_SSH_PORT || 22 }}
           SUDO_PASSWORD: ${{ secrets.SVRD_SUDO_PASSWORD }}
