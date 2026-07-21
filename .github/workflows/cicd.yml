@@ -208,16 +208,22 @@ jobs:
     concurrency:
       group: qlume-production
       cancel-in-progress: false
-    env:
-      # 隔离 docker 配置：避免 macOS self-hosted runner 上的
-      # credsStore(desktop/osxkeychain) 触发 GUI 授权而卡住 docker login
-      DOCKER_CONFIG: ${{ runner.temp }}/docker-config-${{ github.run_id }}
     if: |
       ((github.event_name == 'push') &&
        (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')) ||
       ((github.event_name == 'workflow_dispatch' && github.event.inputs.deploy == true) &&
        (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'))
     steps:
+      - name: Isolate Docker config (skip macOS keychain)
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          # job-level env 不能用 runner.temp；在 step 里用 RUNNER_TEMP 隔离配置，
+          # 避免 docker-credential-desktop/osxkeychain 触发 GUI 授权卡住 login
+          DOCKER_CONFIG_DIR="${RUNNER_TEMP}/docker-config-${GITHUB_RUN_ID}"
+          mkdir -p "${DOCKER_CONFIG_DIR}"
+          echo "DOCKER_CONFIG=${DOCKER_CONFIG_DIR}" >> "${GITHUB_ENV}"
+
       - name: Prepare SSH key
         shell: bash
         env:
