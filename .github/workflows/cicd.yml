@@ -39,7 +39,7 @@ jobs:
           # HOST/USERNAME/PORT 优先用 org Variables，SSH 密钥仍走 Secrets
           SVRD_HOST: ${{ vars.SVRD_HOST || secrets.SVRD_HOST }}
           SVRD_USERNAME: ${{ vars.SVRD_USERNAME || secrets.SVRD_USERNAME }}
-          SVRD_SSH_KEY: ${{ secrets.SVRD_SSH_KEY }}
+          SVRD_SSH_KEY: ${{ secrets.SVR_MINI_SSH_KEY || secrets.SVRD_SSH_KEY }}
           SVRD_SSH_PORT: ${{ vars.SVRD_SSH_PORT || secrets.SVRD_SSH_PORT }}
           SVRD_SUDO_PASSWORD: ${{ secrets.SVRD_SUDO_PASSWORD }}
           APP_PORT_SERVERD: ${{ secrets.APP_PORT_SERVERD || vars.APP_PORT_SERVERD }}
@@ -234,14 +234,17 @@ jobs:
       - name: Prepare SSH key
         shell: bash
         env:
-          SSH_KEY: ${{ secrets.SVRD_SSH_KEY }}
+          # Mac mini runner 走 Tailscale，优先用专用密钥；回退到旧的 SVRD_SSH_KEY
+          SSH_KEY: ${{ secrets.SVR_MINI_SSH_KEY || secrets.SVRD_SSH_KEY }}
         run: |
           set -Eeuo pipefail
-          mkdir -p ~/.ssh
-          chmod 700 ~/.ssh
-          printf '%s\n' "$SSH_KEY" | tr -d '\r' > ~/.ssh/id_ed25519
-          chmod 600 ~/.ssh/id_ed25519
-          ssh-keygen -lf ~/.ssh/id_ed25519
+          # 写到 RUNNER_TEMP 独立路径，避免覆盖 runner 用户 ~/.ssh 下的个人密钥
+          KEY_PATH="${RUNNER_TEMP}/qlume_deploy_key_${GITHUB_RUN_ID}"
+          umask 077
+          printf '%s\n' "$SSH_KEY" | tr -d '\r' > "${KEY_PATH}"
+          chmod 600 "${KEY_PATH}"
+          ssh-keygen -lf "${KEY_PATH}"
+          echo "SSH_KEY_PATH=${KEY_PATH}" >> "${GITHUB_ENV}"
 
       - name: Pull image on runner and export bundle
         env:
@@ -261,7 +264,7 @@ jobs:
           PORT: ${{ vars.SVRD_SSH_PORT || secrets.SVRD_SSH_PORT || 22 }}
         run: |
           set -Eeuo pipefail
-          scp -i ~/.ssh/id_ed25519 -P "${PORT}" -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
+          scp -i "${SSH_KEY_PATH}" -P "${PORT}" -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
             /tmp/qlume-image.tar.gz "${USER}@${HOST}:/tmp/qlume-image.tar.gz"
 
       - name: Deploy to ServerD
@@ -277,7 +280,7 @@ jobs:
         run: |
           set -Eeuo pipefail
 
-          SSH_OPTS="-i ~/.ssh/id_ed25519 -p ${PORT} -o BatchMode=yes -o StrictHostKeyChecking=accept-new"
+          SSH_OPTS="-i ${SSH_KEY_PATH} -p ${PORT} -o BatchMode=yes -o StrictHostKeyChecking=accept-new"
           echo "Connecting to ${USER}@${HOST}:${PORT}"
 
           cat <<'REMOTE_SCRIPT' | ssh ${SSH_OPTS} "${USER}@${HOST}" "IMAGE=${IMAGE} IMAGE_SHA=${IMAGE_SHA} APP_PORT_SERVERD='${APP_PORT_SERVERD}' SUDO_PASSWORD='${SUDO_PASSWORD}' bash -s"
@@ -389,6 +392,7 @@ jobs:
         if: always()
         shell: bash
         run: |
-          rm -f /tmp/qlume-image.tar.gz ~/.ssh/id_ed25519
-          rm -rf "${DOCKER_CONFIG}" 2>/dev/null || true
+          rm -f /tmp/qlume-image.tar.gz
+          rm -f "${SSH_KEY_PATH:-}" 2>/dev/null || true
+          rm -rf "${DOCKER_CONFIG:-}" 2>/dev/null || true
           docker image prune -f >/dev/null 2>&1 || true
