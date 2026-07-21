@@ -214,14 +214,21 @@ jobs:
       ((github.event_name == 'workflow_dispatch' && github.event.inputs.deploy == true) &&
        (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'))
     steps:
-      - name: Isolate Docker config (skip macOS keychain)
+      - name: Login GHCR (isolated config, no keychain)
         shell: bash
+        env:
+          GH_USER: ${{ github.actor }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -Eeuo pipefail
-          # job-level env 不能用 runner.temp；在 step 里用 RUNNER_TEMP 隔离配置，
-          # 避免 docker-credential-desktop/osxkeychain 触发 GUI 授权卡住 login
+          # macOS 上 docker login 即使 config 没配 credsStore，只要 PATH 里有
+          # docker-credential-osxkeychain 也会默认走钥匙串，无 GUI 会话会失败
+          # (-25308)。因此不跑 docker login，直接把 auth 写进隔离配置。
           DOCKER_CONFIG_DIR="${RUNNER_TEMP}/docker-config-${GITHUB_RUN_ID}"
           mkdir -p "${DOCKER_CONFIG_DIR}"
+          AUTH="$(printf '%s:%s' "${GH_USER}" "${GH_TOKEN}" | base64 | tr -d '\n')"
+          umask 077
+          printf '{"auths":{"ghcr.io":{"auth":"%s"}}}\n' "${AUTH}" > "${DOCKER_CONFIG_DIR}/config.json"
           echo "DOCKER_CONFIG=${DOCKER_CONFIG_DIR}" >> "${GITHUB_ENV}"
 
       - name: Prepare SSH key
@@ -235,13 +242,6 @@ jobs:
           printf '%s\n' "$SSH_KEY" | tr -d '\r' > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
           ssh-keygen -lf ~/.ssh/id_ed25519
-
-      - name: Login GHCR (runner, for image pull)
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Pull image on runner and export bundle
         env:
