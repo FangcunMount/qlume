@@ -2,10 +2,10 @@ version: "3.8"
 
 services:
   qlume:
-    image: ghcr.io/fangcunmount/qlume:latest
+    image: ${QLUME_IMAGE:?Set QLUME_IMAGE to an exact sha tag}
     container_name: qlume
     ports:
-      - "3001:3000"
+      - "${APP_PORT_SERVERB:-9099}:3000"
     restart: unless-stopped
     networks:
       infra-network:

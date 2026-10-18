@@ -103,19 +103,19 @@ docker run --rm -p 3000:3000 qlume-local
 - `push` 到 `main/master`，或手动触发并勾选 `deploy` 时，会执行镜像构建、推送到 GHCR，并在 ServerB 上更新容器
 - 容器会加入外部 Docker 网络 `infra-network`
 - 同网络内的上游容器可以直接通过 `http://qlume:3000` 访问它
-- 如果上游不是容器，而是宿主机上的 Nginx，则仍可通过宿主机端口访问，默认是 `3001`
+- 如果上游不是容器，而是宿主机上的 Nginx，则仍可通过宿主机端口访问，默认是 `9099`
 
 ### Required GitHub Secrets
 
 - `SVRB_HOST`: ServerB 地址
 - `SVRB_USERNAME`: ServerB 登录用户
-- `SVRB_SSH_KEY`: GitHub Actions 使用的私钥内容
+- `SVRB_SSH_KEY`: 本仓库专用 deploy 私钥，不回退到 runner 私人 key
+- `SVRB_HOST_FINGERPRINT`: serverB ED25519 SHA256 指纹，经已认证 SSH 通道核实
 
 ### Optional GitHub Secrets
 
 - `SVRB_SSH_PORT`: SSH 端口，可选，默认 `22`
-- `SVRB_SUDO_PASSWORD`: 如果 ServerB 上 `sudo` 需要密码，则必须配置
-- `APP_PORT_SERVERB`: 宿主机暴露给 Nginx 反向代理的本地端口，默认 `3001`
+- `APP_PORT_SERVERB`: 宿主机暴露给 Nginx 反向代理的本地端口，默认 `9099`
 - `DOCKERHUB_USERNAME`: 可选，配置后会额外镜像同步到 Docker Hub
 - `DOCKERHUB_TOKEN`: 可选，Docker Hub access token
 
@@ -126,10 +126,20 @@ docker run --rm -p 3000:3000 qlume-local
 - Docker network alias：`qlume`
 - 容器内监听端口：`3000`
 - 同网络容器访问地址：`http://qlume:3000`
-- 宿主机默认绑定端口：`3001`
+- 宿主机默认绑定端口：`9099`
 - 镜像地址：`ghcr.io/fangcunmount/qlume`
 
 ## Notes
 
 - 当前 canonical URL 仍然指向 `https://www.fangcunmount.cn/`
 - 如果后续品牌域名切到新的 `qlume` 域名，需要同步更新 [index.html](index.html) 里的 canonical 和业务链接
+
+### serverB 发布与迁移约束
+
+生产目录 `/opt/qlume` 由 deploy 管理，用户需能直接运行 Docker；发布先校验 `hostname -s = serverB`，使用服务器端 `.deploy.lock` 串行，保留原镜像作为健康检查失败时的回滚版本。Mac mini runner 继续拉取 `linux/amd64` 精确 SHA 镜像，再通过公网 SSH 传包；密钥和 GHCR 认证位于任务专用临时目录，任务结束清除，不执行全局镜像 prune。SSH 使用固定 ED25519 指纹和私有 known_hosts。
+
+serverA 的官网 vhost 使用 Docker DNS resolver（10 秒刷新）访问 `qlume:3000`，容器重建后自动刷新 IP，无需每次发布重载入口。首次部署此 vhost 时需执行 `nginx -t` 并 reload。公网域名、TLS、业务入口链接保持原样。
+
+官网是无持久化卷的静态服务，迁移先使用 serverD 的原镜像进行隔离预验证，再停旧端并在 serverB 启动正式服务名。serverD 原镜像与 inspect 归档保留用于受控回滚；不能让两台主机同时以 qlume alias 加入 overlay。Compose 手动入口必须显式提供 `QLUME_IMAGE=ghcr.io/fangcunmount/qlume:sha-<SHA>`，宿主机端口使用 `APP_PORT_SERVERB`，默认保持原生产端口 9099。
+
+迁移验收分别核对原镜像/静态资源一致性、主干 CI/CD 的实际部署 SHA、容器健康和公网入口；不把官网部署等同于小程序或后端业务验收。
