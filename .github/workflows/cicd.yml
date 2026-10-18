@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
     inputs:
       deploy:
-        description: "是否部署到 ServerD（只允许 main/master 分支）"
+        description: "是否部署到 ServerB（只允许 main/master 分支）"
         required: false
         type: boolean
         default: false
@@ -19,7 +19,7 @@ permissions:
 
 concurrency:
   group: qlume-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 env:
   REGISTRY: ghcr.io
@@ -37,12 +37,12 @@ jobs:
         shell: bash
         env:
           # HOST/USERNAME/PORT 优先用 org Variables，SSH 密钥仍走 Secrets
-          SVRD_HOST: ${{ vars.SVRD_HOST || secrets.SVRD_HOST }}
-          SVRD_USERNAME: ${{ vars.SVRD_USERNAME || secrets.SVRD_USERNAME }}
-          SVRD_SSH_KEY: ${{ secrets.SVR_MINI_SSH_KEY || secrets.SVRD_SSH_KEY }}
-          SVRD_SSH_PORT: ${{ vars.SVRD_SSH_PORT || secrets.SVRD_SSH_PORT }}
-          SVRD_SUDO_PASSWORD: ${{ secrets.SVRD_SUDO_PASSWORD }}
-          APP_PORT_SERVERD: ${{ secrets.APP_PORT_SERVERD || vars.APP_PORT_SERVERD }}
+          SVRB_HOST: ${{ secrets.SVRB_HOST || vars.SVRB_HOST }}
+          SVRB_USERNAME: ${{ secrets.SVRB_USERNAME || vars.SVRB_USERNAME }}
+          SVRB_SSH_KEY: ${{ secrets.SVRB_SSH_KEY }}
+          SVRB_SSH_PORT: ${{ secrets.SVRB_SSH_PORT || vars.SVRB_SSH_PORT }}
+          SVRB_HOST_FINGERPRINT: ${{ secrets.SVRB_HOST_FINGERPRINT }}
+          APP_PORT_SERVERB: ${{ secrets.APP_PORT_SERVERB || vars.APP_PORT_SERVERB }}
           DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
           DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
         run: |
@@ -57,8 +57,8 @@ jobs:
             echo "非 main/master 分支：仅提示缺失，不阻断"
           fi
 
-          REQUIRED_SECRETS=(SVRD_HOST SVRD_USERNAME SVRD_SSH_KEY)
-          OPTIONAL_SECRETS=(SVRD_SSH_PORT SVRD_SUDO_PASSWORD APP_PORT_SERVERD DOCKERHUB_USERNAME DOCKERHUB_TOKEN)
+          REQUIRED_SECRETS=(SVRB_HOST SVRB_USERNAME SVRB_SSH_KEY SVRB_HOST_FINGERPRINT)
+          OPTIONAL_SECRETS=(SVRB_SSH_PORT APP_PORT_SERVERB DOCKERHUB_USERNAME DOCKERHUB_TOKEN)
 
           for SECRET_NAME in "${REQUIRED_SECRETS[@]}"; do
             VALUE="${!SECRET_NAME:-}"
@@ -80,11 +80,11 @@ jobs:
               echo "OK: ${SECRET_NAME} is set"
             else
               case "$SECRET_NAME" in
-                SVRD_SSH_PORT)
+                SVRB_SSH_PORT)
                   echo "WARN: ${SECRET_NAME} is not set, fallback to 22"
                   ;;
-                APP_PORT_SERVERD)
-                  echo "WARN: ${SECRET_NAME} is not set, fallback to 3001"
+                APP_PORT_SERVERB)
+                  echo "WARN: ${SECRET_NAME} is not set, fallback to 9099"
                   ;;
                 DOCKERHUB_TOKEN|DOCKERHUB_USERNAME)
                   echo "WARN: ${SECRET_NAME} is not set — GHCR 失败时无法回退 Docker Hub"
@@ -195,8 +195,8 @@ jobs:
             fi
           fi
 
-  deploy_serverd:
-    name: Deploy To ServerD
+  deploy_serverb:
+    name: Deploy To ServerB
     needs: [docker_build_push]
     runs-on:
       group: qlume
@@ -211,7 +211,7 @@ jobs:
     if: |
       ((github.event_name == 'push') &&
        (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')) ||
-      ((github.event_name == 'workflow_dispatch' && github.event.inputs.deploy == true) &&
+      ((github.event_name == 'workflow_dispatch' && inputs.deploy) &&
        (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'))
     steps:
       - name: Login GHCR (isolated config, no keychain)
@@ -224,7 +224,12 @@ jobs:
           # macOS 上 docker login 即使 config 没配 credsStore，只要 PATH 里有
           # docker-credential-osxkeychain 也会默认走钥匙串，无 GUI 会话会失败
           # (-25308)。因此不跑 docker login，直接把 auth 写进隔离配置。
-          DOCKER_CONFIG_DIR="${RUNNER_TEMP}/docker-config-${GITHUB_RUN_ID}"
+          ARTIFACT_DIR="${RUNNER_TEMP}/qlume-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          umask 077
+          mkdir -p "$ARTIFACT_DIR"
+          chmod 700 "$ARTIFACT_DIR"
+          echo "ARTIFACT_DIR=$ARTIFACT_DIR" >> "$GITHUB_ENV"
+          DOCKER_CONFIG_DIR="${ARTIFACT_DIR}/docker-config"
           mkdir -p "${DOCKER_CONFIG_DIR}"
           AUTH="$(printf '%s:%s' "${GH_USER}" "${GH_TOKEN}" | base64 | tr -d '\n')"
           umask 077
@@ -234,86 +239,90 @@ jobs:
       - name: Prepare SSH key
         shell: bash
         env:
-          # Mac mini runner 走 Tailscale，优先用专用密钥；回退到旧的 SVRD_SSH_KEY
-          SSH_KEY: ${{ secrets.SVR_MINI_SSH_KEY || secrets.SVRD_SSH_KEY }}
+          # 使用仓库专用 serverB deploy key，不回退到 serverD 或 runner 私人密钥
+          SSH_KEY: ${{ secrets.SVRB_SSH_KEY }}
+          HOST: ${{ secrets.SVRB_HOST || vars.SVRB_PUBLIC_HOST || vars.SVRB_HOST }}
+          PORT: ${{ secrets.SVRB_SSH_PORT || vars.SVRB_SSH_PORT || 22 }}
+          HOST_FINGERPRINT: ${{ secrets.SVRB_HOST_FINGERPRINT }}
         run: |
           set -Eeuo pipefail
           # 写到 RUNNER_TEMP 独立路径，避免覆盖 runner 用户 ~/.ssh 下的个人密钥
-          KEY_PATH="${RUNNER_TEMP}/qlume_deploy_key_${GITHUB_RUN_ID}"
+          KEY_PATH="${ARTIFACT_DIR}/deploy_key"
           umask 077
           printf '%s\n' "$SSH_KEY" | tr -d '\r' > "${KEY_PATH}"
           chmod 600 "${KEY_PATH}"
           ssh-keygen -lf "${KEY_PATH}"
           echo "SSH_KEY_PATH=${KEY_PATH}" >> "${GITHUB_ENV}"
+          KNOWN_HOSTS="${ARTIFACT_DIR}/known_hosts"
+          ssh-keyscan -T 10 -p "$PORT" -t ed25519 "$HOST" > "$KNOWN_HOSTS"
+          ACTUAL=$(ssh-keygen -lf "$KNOWN_HOSTS" -E sha256 | awk '{print $2}')
+          test "$ACTUAL" = "$HOST_FINGERPRINT" || { echo "Host fingerprint mismatch" >&2; exit 1; }
+          echo "SSH_KNOWN_HOSTS=$KNOWN_HOSTS" >> "$GITHUB_ENV"
 
       - name: Pull image on runner and export bundle
         env:
           IMAGE_REF: ${{ env.IMAGE }}:sha-${{ github.sha }}
         run: |
           set -Eeuo pipefail
-          # Mac Runner 为 ARM64，serverD 为 linux/amd64，必须指定平台
+          # Mac Runner 为 ARM64，serverB 为 linux/amd64，必须指定平台
           docker pull --platform linux/amd64 "${IMAGE_REF}"
-          docker save "${IMAGE_REF}" | gzip -1 > /tmp/qlume-image.tar.gz
-          ls -lh /tmp/qlume-image.tar.gz
+          docker save "${IMAGE_REF}" | gzip -1 > "${ARTIFACT_DIR}/qlume-image.tar.gz"
+          ls -lh "${ARTIFACT_DIR}/qlume-image.tar.gz"
 
-      - name: Upload image bundle to ServerD
+      - name: Upload image bundle to ServerB
         shell: bash
         env:
           # 大文件走公网：Tailscale DERP 中继太慢（~50KB/s）；打洞成功前优先公网
-          HOST: ${{ vars.SVRD_PUBLIC_HOST || secrets.SVRD_PUBLIC_HOST || vars.SVRD_HOST || secrets.SVRD_HOST }}
-          USER: ${{ vars.SVRD_USERNAME || secrets.SVRD_USERNAME }}
-          PORT: ${{ vars.SVRD_SSH_PORT || secrets.SVRD_SSH_PORT || 22 }}
+          HOST: ${{ secrets.SVRB_HOST || vars.SVRB_PUBLIC_HOST || vars.SVRB_HOST }}
+          DEPLOY_USER: ${{ secrets.SVRB_USERNAME || vars.SVRB_USERNAME }}
+          PORT: ${{ secrets.SVRB_SSH_PORT || vars.SVRB_SSH_PORT || 22 }}
         run: |
           set -Eeuo pipefail
-          echo "Uploading bundle to ${USER}@${HOST}:${PORT}"
-          scp -i "${SSH_KEY_PATH}" -P "${PORT}" -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
-            /tmp/qlume-image.tar.gz "${USER}@${HOST}:/tmp/qlume-image.tar.gz"
+          echo "Uploading bundle to ${DEPLOY_USER}@${HOST}:${PORT}"
+          scp -i "${SSH_KEY_PATH}" -P "${PORT}" -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="${SSH_KNOWN_HOSTS}" -o HostKeyAlgorithms=ssh-ed25519 \
+            "${ARTIFACT_DIR}/qlume-image.tar.gz" "${DEPLOY_USER}@${HOST}:/opt/qlume/image-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.tar.gz"
 
-      - name: Deploy to ServerD
+      - name: Deploy to ServerB
         shell: bash
         env:
-          HOST: ${{ vars.SVRD_PUBLIC_HOST || secrets.SVRD_PUBLIC_HOST || vars.SVRD_HOST || secrets.SVRD_HOST }}
-          USER: ${{ vars.SVRD_USERNAME || secrets.SVRD_USERNAME }}
-          PORT: ${{ vars.SVRD_SSH_PORT || secrets.SVRD_SSH_PORT || 22 }}
-          SUDO_PASSWORD: ${{ secrets.SVRD_SUDO_PASSWORD }}
+          HOST: ${{ secrets.SVRB_HOST || vars.SVRB_PUBLIC_HOST || vars.SVRB_HOST }}
+          DEPLOY_USER: ${{ secrets.SVRB_USERNAME || vars.SVRB_USERNAME }}
+          PORT: ${{ secrets.SVRB_SSH_PORT || vars.SVRB_SSH_PORT || 22 }}
           IMAGE: ${{ env.IMAGE }}
           IMAGE_SHA: ${{ github.sha }}
-          APP_PORT_SERVERD: ${{ secrets.APP_PORT_SERVERD || vars.APP_PORT_SERVERD }}
+          APP_PORT_SERVERB: ${{ secrets.APP_PORT_SERVERB || vars.APP_PORT_SERVERB }}
         run: |
           set -Eeuo pipefail
 
-          SSH_OPTS="-i ${SSH_KEY_PATH} -p ${PORT} -o BatchMode=yes -o StrictHostKeyChecking=accept-new"
-          echo "Connecting to ${USER}@${HOST}:${PORT}"
+          SSH_OPTS=(-i "$SSH_KEY_PATH" -p "$PORT" -o BatchMode=yes -o StrictHostKeyChecking=yes -o "UserKnownHostsFile=$SSH_KNOWN_HOSTS" -o HostKeyAlgorithms=ssh-ed25519)
+          echo "Connecting to ${DEPLOY_USER}@${HOST}:${PORT}"
 
-          cat <<'REMOTE_SCRIPT' | ssh ${SSH_OPTS} "${USER}@${HOST}" "IMAGE=${IMAGE} IMAGE_SHA=${IMAGE_SHA} APP_PORT_SERVERD='${APP_PORT_SERVERD}' SUDO_PASSWORD='${SUDO_PASSWORD}' bash -s"
+          [[ "${APP_PORT_SERVERB:-9099}" =~ ^[0-9]+$ ]] || exit 1
+          # The client expands only the fixed image/ref, numeric port and unique bundle path.
+          # shellcheck disable=SC2029
+          cat <<'REMOTE_SCRIPT' | ssh "${SSH_OPTS[@]}" "${DEPLOY_USER}@${HOST}" "IMAGE=${IMAGE} IMAGE_SHA=${IMAGE_SHA} APP_PORT_SERVERB='${APP_PORT_SERVERB}' BUNDLE=/opt/qlume/image-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.tar.gz bash -s"
           set -Eeuo pipefail
 
           CONTAINER_NAME="qlume"
           NETWORK_NAME="infra-network"
           IMAGE_NAME="${IMAGE}:sha-${IMAGE_SHA}"
-          BUNDLE="/tmp/qlume-image.tar.gz"
           APP_PORT="3000"
-          HOST_PORT="${APP_PORT_SERVERD:-3001}"
+          HOST_PORT="${APP_PORT_SERVERB:-9099}"
           PREV_IMAGE=""
           USE_IMAGE="${IMAGE_NAME}"
 
-          if sudo -n true 2>/dev/null; then
-            SUDO="sudo"
-          else
-            if [ -z "${SUDO_PASSWORD:-}" ]; then
-              echo "sudo 需要密码，但没有配置 SVRD_SUDO_PASSWORD" >&2
-              exit 1
-            fi
-            sudo_pw() { sudo -S "$@" <<<"$SUDO_PASSWORD"; }
-            export -f sudo_pw
-            SUDO="sudo_pw"
-            $SUDO -v || true
-          fi
+          test "$(hostname -s)" = serverB || { echo "Unexpected deployment host" >&2; exit 1; }
+          [[ "$HOST_PORT" =~ ^[0-9]+$ ]] && (( HOST_PORT > 0 && HOST_PORT < 65536 )) || exit 1
+          exec 9>/opt/qlume/.deploy.lock
+          flock -w 900 9 || { echo "Another deployment holds the lock" >&2; exit 1; }
 
           if ! command -v docker >/dev/null 2>&1; then
-            echo "ServerD 缺少 docker，无法部署容器" >&2
+            echo "ServerB 缺少 docker，无法部署容器" >&2
             exit 1
           fi
+          docker info >/dev/null
+          TEMP_TAR=""
+          trap 'rm -f -- "${TEMP_TAR:-}" "$BUNDLE"' EXIT
 
           if [ ! -f "${BUNDLE}" ]; then
             echo "未找到镜像包 ${BUNDLE}" >&2
@@ -326,52 +335,57 @@ jobs:
 
           TEMP_TAR="$(mktemp)"
           gunzip -c "${BUNDLE}" > "${TEMP_TAR}"
-          $SUDO docker load -i "${TEMP_TAR}"
+          docker load -i "${TEMP_TAR}"
           rm -f "${TEMP_TAR}" "${BUNDLE}"
 
-          if ! $SUDO docker network ls --format '{{.Name}}' | grep -q "^${NETWORK_NAME}$"; then
-            echo "Network ${NETWORK_NAME} not found. Initialize ServerD Swarm/infra-network first." >&2
+          test "$(docker image inspect "$IMAGE_NAME" --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')" = "$IMAGE_SHA" || { echo "Image revision mismatch" >&2; exit 1; }
+          test "$(docker image inspect "$IMAGE_NAME" --format '{{.Architecture}}')" = amd64 || exit 1
+
+          if ! docker network ls --format '{{.Name}}' | grep -q "^${NETWORK_NAME}$"; then
+            echo "Network ${NETWORK_NAME} not found. Initialize ServerB Swarm/infra-network first." >&2
             exit 1
           fi
 
-          if $SUDO docker ps -a --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
-            PREV_IMAGE="$($SUDO docker inspect --format '{{.Config.Image}}' "${CONTAINER_NAME}" 2>/dev/null || true)"
+          if docker ps -a --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
+            PREV_IMAGE="$(docker inspect --format '{{.Config.Image}}' "${CONTAINER_NAME}" 2>/dev/null || true)"
             if [ -n "${PREV_IMAGE}" ]; then
               echo "Previous image detected: ${PREV_IMAGE}"
             fi
-            $SUDO docker stop "${CONTAINER_NAME}" || true
-            $SUDO docker rm "${CONTAINER_NAME}" || true
+            docker stop "${CONTAINER_NAME}" || true
+            docker rm "${CONTAINER_NAME}" || true
           fi
 
           echo "Run container: ${CONTAINER_NAME}"
-          $SUDO docker run -d \
+          HEALTH_OK=0
+          if docker run -d \
             --name "${CONTAINER_NAME}" \
             --network "${NETWORK_NAME}" \
             --network-alias "qlume" \
             --restart unless-stopped \
             -p ${HOST_PORT}:${APP_PORT} \
-            "${USE_IMAGE}"
+            "${USE_IMAGE}"; then
 
           echo "Health check (docker exec -> http://127.0.0.1:${APP_PORT}/)..."
-          HEALTH_OK=0
           sleep 5
           for i in $(seq 1 45); do
-            if $SUDO docker exec "${CONTAINER_NAME}" wget -qO- -T 3 "http://127.0.0.1:${APP_PORT}/" >/dev/null 2>&1; then
+            if docker exec "${CONTAINER_NAME}" wget -qO- -T 3 "http://127.0.0.1:${APP_PORT}/" >/dev/null 2>&1; then
               HEALTH_OK=1
               break
             fi
             sleep 2
           done
 
+          fi
+
           if [ "${HEALTH_OK}" -ne 1 ]; then
             echo "Health check failed, start rollback..."
-            $SUDO docker logs --tail 100 "${CONTAINER_NAME}" || true
-            $SUDO docker stop "${CONTAINER_NAME}" || true
-            $SUDO docker rm "${CONTAINER_NAME}" || true
+            docker logs --tail 100 "${CONTAINER_NAME}" || true
+            docker stop "${CONTAINER_NAME}" || true
+            docker rm "${CONTAINER_NAME}" || true
 
             if [ -n "${PREV_IMAGE}" ]; then
               echo "Rollback to previous image: ${PREV_IMAGE}"
-              $SUDO docker run -d \
+              docker run -d \
                 --name "${CONTAINER_NAME}" \
                 --network "${NETWORK_NAME}" \
                 --network-alias "qlume" \
@@ -379,7 +393,7 @@ jobs:
                 -p ${HOST_PORT}:${APP_PORT} \
                 "${PREV_IMAGE}"
               echo "Deployment rolled back."
-              $SUDO docker ps --filter "name=${CONTAINER_NAME}" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}\t{{.Image}}"
+              docker ps --filter "name=${CONTAINER_NAME}" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}\t{{.Image}}"
             else
               echo "No previous image available, rollback skipped." >&2
             fi
@@ -387,14 +401,11 @@ jobs:
           fi
 
           echo "Done. Current status:"
-          $SUDO docker ps --filter "name=${CONTAINER_NAME}" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}\t{{.Image}}"
+          docker ps --filter "name=${CONTAINER_NAME}" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}\t{{.Image}}"
           REMOTE_SCRIPT
 
       - name: Cleanup runner artifacts
         if: always()
         shell: bash
         run: |
-          rm -f /tmp/qlume-image.tar.gz
-          rm -f "${SSH_KEY_PATH:-}" 2>/dev/null || true
-          rm -rf "${DOCKER_CONFIG:-}" 2>/dev/null || true
-          docker image prune -f >/dev/null 2>&1 || true
+          if [ -n "${ARTIFACT_DIR:-}" ]; then rm -rf -- "$ARTIFACT_DIR"; fi
